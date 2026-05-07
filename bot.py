@@ -458,6 +458,8 @@ class TradeBotScheduler:
             self.schedule_jobs()
             self.scheduler.start()
 
+            await self.scan_and_notify()
+
             logger.info("🚀 Trade bot started successfully")
 
             while True:
