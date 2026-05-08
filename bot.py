@@ -20,11 +20,11 @@ IST = pytz.timezone("Asia/Kolkata")
 # CHANGED: Centralized strategy thresholds for easier production tuning
 EMA_FAST = 20
 EMA_SLOW = 50
-MIN_VOLUME_RATIO = 1.2
-MIN_MOMENTUM_PCT = 0.25
+MIN_VOLUME_RATIO = 1.8
+MIN_MOMENTUM_PCT = 0.8
 MIN_AVG_RANGE_PCT = 0.04
 MIN_EMA_GAP_PCT = 0.01
-MAX_EXTENSION_FROM_EMA20_PCT = 2.0
+MAX_EXTENSION_FROM_EMA20_PCT = 1.2
 
 # Logging
 logging.basicConfig(
@@ -141,7 +141,7 @@ class TradeScanner:
             if data.empty or today_data.empty or len(data) < EMA_SLOW or len(today_data) < 3:
                 return None
 
-            last_3 = today_data.tail(3)
+            last_3 = today_data.tail(2)
             latest = last_3.iloc[-1]
             previous_data = data.loc[data.index < latest.name].tail(20)
             vwap = float(latest["VWAP"])
@@ -231,7 +231,7 @@ class TradeScanner:
                 and (
                     metrics["higher_highs"]
                     or metrics["higher_lows"]
-                    or metrics["momentum_pct"] > 0.6
+                    or metrics["momentum_pct"] > 0.8
                 )
                 and metrics["volume_ratio"] >= MIN_VOLUME_RATIO
                 and metrics["momentum_pct"] >= MIN_MOMENTUM_PCT
@@ -243,7 +243,11 @@ class TradeScanner:
             ):
                 entry = metrics["current_price"]
                 stop_loss = entry * 0.995
-                target = entry * 1.01
+                target = entry * 1.015
+
+                # Skip already pumped stocks
+                if metrics["momentum_pct"] > 2.2:
+                    return None
 
                 return {
                     "symbol": symbol,
@@ -444,7 +448,7 @@ class TradeBotScheduler:
             "cron",
             day_of_week="0-4",
             hour=9,
-            minute=25,
+            minute=18,
             timezone=IST,
             id="trade_scan_0925",
             replace_existing=True,
