@@ -3,7 +3,7 @@ import asyncio
 import logging
 from datetime import datetime, time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 
 import pandas as pd
 import yfinance as yf
@@ -24,13 +24,13 @@ IST = pytz.timezone("Asia/Kolkata")
 EMA_FAST = 20
 EMA_SLOW = 50
 
-MIN_GAP_PCT = 0.8
-MIN_VOLUME_RATIO = 1.5
-MIN_MOMENTUM_PCT = 0.8
-MAX_MOMENTUM_PCT = 2.5
+MIN_GAP_PCT = 0.4
+MIN_VOLUME_RATIO = 1.0
+MIN_MOMENTUM_PCT = 0.5
+MAX_MOMENTUM_PCT = 6.0
 
-MAX_WICK_RATIO = 0.45
-MIN_BODY_RATIO = 0.35
+MAX_WICK_RATIO = 0.85
+MIN_BODY_RATIO = 0.10
 
 TOP_STOCKS_LIMIT = 5
 MAX_WORKERS = 10
@@ -191,7 +191,7 @@ class TradeScanner:
         return opening_data.iloc[0]
 
     def is_clean_structure(self, candle: pd.Series, direction: str) -> bool:
-        """Reject weak candles, long wicks and sideways structures."""
+        """Reject only extremely weak candles while allowing normal small wicks."""
         high = float(candle["High"])
         low = float(candle["Low"])
         open_price = float(candle["Open"])
@@ -306,8 +306,6 @@ class TradeScanner:
             )
 
             recent_candles = today_data.tail(3)
-            higher_closes = recent_candles["Close"].is_monotonic_increasing
-            lower_closes = recent_candles["Close"].is_monotonic_decreasing
 
             return {
                 "latest": latest,
@@ -326,8 +324,6 @@ class TradeScanner:
                 "volume_ratio": volume_ratio,
                 "bullish_breakout_strength": bullish_breakout_strength,
                 "bearish_breakout_strength": bearish_breakout_strength,
-                "higher_closes": higher_closes,
-                "lower_closes": lower_closes,
             }
 
         except Exception as e:
