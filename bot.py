@@ -17,8 +17,8 @@ from telegram.error import TelegramError
 # Configuration
 # =========================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+BOT_TOKEN = os.getenv("8720565531:AAG5N6qXkFSWlPNixIis5qYYdW_WexQ66D0")
+CHAT_ID = os.getenv("5724504948")
 IST = pytz.timezone("Asia/Kolkata")
 
 EMA_FAST = 20
