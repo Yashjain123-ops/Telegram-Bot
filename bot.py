@@ -3,7 +3,7 @@ import asyncio
 import logging
 from datetime import datetime, time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import yfinance as yf
@@ -24,15 +24,15 @@ IST = pytz.timezone("Asia/Kolkata")
 EMA_FAST = 20
 EMA_SLOW = 50
 
-MIN_GAP_PCT = 0.4
-MIN_VOLUME_RATIO = 1.0
-MIN_MOMENTUM_PCT = 0.5
-MAX_MOMENTUM_PCT = 6.0
+MIN_VOLUME_RATIO = 2.5
+MIN_BREAKOUT_STRENGTH_PCT = 0.35
+MAX_BREAKOUT_STRENGTH_PCT = 3.0
 
-MAX_WICK_RATIO = 0.85
-MIN_BODY_RATIO = 0.10
+MAX_OPPOSING_WICK_RATIO = 0.90
+MIN_BODY_RATIO = 0.05
 
-TOP_STOCKS_LIMIT = 5
+TOP_STOCKS_LIMIT = 3
+MIN_STOCKS_LIMIT = 3
 MAX_WORKERS = 10
 
 
@@ -95,13 +95,47 @@ class TradeScanner:
 
     def __init__(self):
         self.executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+        self.debug_stats = {}
+
+    def reset_debug_stats(self):
+        self.debug_stats = {
+            "total_scanned": 0,
+            "data_ok": 0,
+            "orb_ok": 0,
+            "breakout_ok": 0,
+            "ema_ok": 0,
+            "vwap_ok": 0,
+            "volume_ok": 0,
+            "momentum_ok": 0,
+            "structure_ok": 0,
+            "accepted": 0,
+        }
+
+    def increment_stat(self, key: str):
+        self.debug_stats[key] = self.debug_stats.get(key, 0) + 1
+
+    def log_rejection(self, symbol: str, reason: str, metrics: Optional[Dict] = None):
+        if metrics:
+            logger.info(
+                "REJECTED %s -> %s | ORB high=%.2f | ORB low=%.2f | confirmation close=%.2f | "
+                "breakout strength=%.3f%% | volume ratio=%.2f",
+                symbol,
+                reason,
+                metrics.get("opening_high", 0.0),
+                metrics.get("opening_low", 0.0),
+                metrics.get("confirmation_close", 0.0),
+                metrics.get("active_breakout_strength", 0.0),
+                metrics.get("volume_ratio", 0.0),
+            )
+        else:
+            logger.info("REJECTED %s -> %s", symbol, reason)
 
     def fetch_stock_data(self, symbol: str) -> Optional[pd.DataFrame]:
-        """Fetch 5-minute candles with enough history for EMA calculations."""
+        """Fetch 5-minute candles with enough history for EMA, VWAP and volume calculations."""
         try:
             data = yf.download(
                 symbol + ".NS",
-                period="5d",
+                period="10d",
                 interval="5m",
                 progress=False,
                 prepost=False,
@@ -117,7 +151,7 @@ class TradeScanner:
 
             required_columns = {"Open", "High", "Low", "Close", "Volume"}
             if not required_columns.issubset(data.columns):
-                logger.warning(f"{symbol}: missing required columns")
+                logger.warning("%s: missing required columns", symbol)
                 return None
 
             data = data.dropna(subset=["Open", "High", "Low", "Close"])
@@ -132,7 +166,7 @@ class TradeScanner:
             return data
 
         except Exception as e:
-            logger.error(f"Error fetching data for {symbol}: {e}")
+            logger.error("Error fetching data for %s: %s", symbol, e)
             return None
 
     def add_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
@@ -145,7 +179,7 @@ class TradeScanner:
         typical_price = (data["High"] + data["Low"] + data["Close"]) / 3
         price_volume = typical_price * data["Volume"]
 
-        session = data.index.date
+        session = pd.Series(data.index.date, index=data.index)
         data["PV_CUM"] = price_volume.groupby(session).cumsum()
         data["VOL_CUM"] = data["Volume"].groupby(session).cumsum()
         data["VWAP"] = data["PV_CUM"] / data["VOL_CUM"].replace(0, pd.NA)
@@ -178,20 +212,57 @@ class TradeScanner:
         except Exception:
             return None
 
-    def get_opening_candle(self, today_data: pd.DataFrame) -> Optional[pd.Series]:
-        """Get the 9:15-9:20 opening range candle."""
-        opening_data = today_data[
-            (today_data.index.time >= time(9, 15)) &
-            (today_data.index.time < time(9, 20))
+    def get_candle_by_time(
+        self,
+        today_data: pd.DataFrame,
+        start_time: time,
+        end_time: time,
+    ) -> Optional[pd.Series]:
+        """Get a 5-minute candle by its timestamp window."""
+        candle_data = today_data[
+            (today_data.index.time >= start_time) &
+            (today_data.index.time < end_time)
         ]
 
-        if opening_data.empty:
+        if candle_data.empty:
             return None
 
-        return opening_data.iloc[0]
+        return candle_data.iloc[0]
+
+    def get_opening_candle(self, today_data: pd.DataFrame) -> Optional[pd.Series]:
+        """Get the completed 9:15-9:20 opening range candle."""
+        return self.get_candle_by_time(today_data, time(9, 15), time(9, 20))
+
+    def get_confirmation_candle(self, today_data: pd.DataFrame) -> Optional[pd.Series]:
+        """Get the completed 9:20-9:25 confirmation candle."""
+        return self.get_candle_by_time(today_data, time(9, 20), time(9, 25))
+
+    def get_previous_first_hour_avg_volume(
+        self,
+        data: pd.DataFrame,
+        today_data: pd.DataFrame,
+    ) -> Optional[float]:
+        """Average first-hour 5-minute candle volume from previous trading sessions."""
+        try:
+            today = today_data.index[0].date()
+            previous_data = data[data.index.date < today]
+
+            first_hour_data = previous_data[
+                (previous_data.index.time >= time(9, 15)) &
+                (previous_data.index.time < time(10, 15))
+            ]
+
+            if first_hour_data.empty:
+                return None
+
+            avg_volume = float(first_hour_data["Volume"].mean())
+            return avg_volume if avg_volume > 0 else None
+
+        except Exception:
+            return None
 
     def is_clean_structure(self, candle: pd.Series, direction: str) -> bool:
-        """Reject only extremely weak candles while allowing normal small wicks."""
+        """Reject only extremely weak confirmation candles."""
         high = float(candle["High"])
         low = float(candle["Low"])
         open_price = float(candle["Open"])
@@ -213,39 +284,39 @@ class TradeScanner:
         if direction == "BULLISH":
             if close <= open_price:
                 return False
-            if upper_wick_ratio > MAX_WICK_RATIO:
+            if upper_wick_ratio > MAX_OPPOSING_WICK_RATIO:
                 return False
 
         if direction == "BEARISH":
             if close >= open_price:
                 return False
-            if lower_wick_ratio > MAX_WICK_RATIO:
+            if lower_wick_ratio > MAX_OPPOSING_WICK_RATIO:
                 return False
 
         return True
 
     def calculate_score(
         self,
-        gap_pct: float,
         volume_ratio: float,
         breakout_strength_pct: float,
         ema_aligned: bool,
+        vwap_aligned: bool,
         clean_structure: bool,
     ) -> int:
         """Calculate score out of 100."""
         score = 0
 
         if volume_ratio >= MIN_VOLUME_RATIO:
-            score += min(30, int((volume_ratio / 3.0) * 30))
-
-        if abs(gap_pct) >= MIN_GAP_PCT:
-            score += min(20, int((abs(gap_pct) / 2.0) * 20))
+            score += min(30, int((volume_ratio / 2.5) * 30))
 
         if breakout_strength_pct > 0:
-            score += min(25, int((breakout_strength_pct / 1.0) * 25))
-
+            score += min(40, int((breakout_strength_pct / 1.0) * 40))
+            
         if ema_aligned:
-            score += 15
+            score += 20
+
+        if vwap_aligned:
+            score += 10
 
         if clean_structure:
             score += 10
@@ -253,230 +324,348 @@ class TradeScanner:
         return min(score, 100)
 
     def calculate_metrics(self, data: pd.DataFrame, today_data: pd.DataFrame) -> Optional[Dict]:
-        """Calculate ORB, gap, trend, volume and momentum metrics."""
+        """Calculate ORB, confirmation candle, trend, volume and breakout metrics."""
         try:
             if data.empty or today_data.empty or len(data) < EMA_SLOW:
                 return None
 
             opening_candle = self.get_opening_candle(today_data)
-            if opening_candle is None:
-                return None
+            confirmation_candle = self.get_confirmation_candle(today_data)
 
-            candles_after_opening = today_data[today_data.index > opening_candle.name]
-            if candles_after_opening.empty:
+            if opening_candle is None or confirmation_candle is None:
                 return None
-
-            latest = candles_after_opening.iloc[-1]
 
             previous_close = self.get_previous_close(data, today_data)
             if previous_close is None or previous_close <= 0:
                 return None
 
             today_open = float(today_data["Open"].iloc[0])
-            current_price = float(latest["Close"])
             opening_high = float(opening_candle["High"])
             opening_low = float(opening_candle["Low"])
 
-            ema20 = float(latest["EMA20"])
-            ema50 = float(latest["EMA50"])
-            vwap = float(latest["VWAP"])
+            confirmation_open = float(confirmation_candle["Open"])
+            confirmation_high = float(confirmation_candle["High"])
+            confirmation_low = float(confirmation_candle["Low"])
+            confirmation_close = float(confirmation_candle["Close"])
+            confirmation_volume = float(confirmation_candle["Volume"])
 
-            if any(pd.isna(x) for x in [today_open, current_price, ema20, ema50, vwap]):
+            ema20 = float(confirmation_candle["EMA20"])
+            ema50 = float(confirmation_candle["EMA50"])
+            vwap = float(confirmation_candle["VWAP"])
+
+            if any(pd.isna(x) for x in [today_open, opening_high, opening_low, confirmation_close, ema20, ema50, vwap]):
                 return None
 
+            avg_first_hour_volume = self.get_previous_first_hour_avg_volume(data, today_data)
+            if avg_first_hour_volume is None:
+                return None
+
+            volume_ratio = confirmation_volume / avg_first_hour_volume if avg_first_hour_volume > 0 else 0
             gap_pct = ((today_open - previous_close) / previous_close) * 100
-            momentum_pct = ((current_price - today_open) / today_open) * 100
-
-            previous_volume_data = data[data.index < latest.name].tail(20)
-            if previous_volume_data.empty:
-                return None
-
-            current_volume = float(latest["Volume"])
-            avg_volume = float(previous_volume_data["Volume"].mean())
-            volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0
 
             bullish_breakout_strength = (
-                ((current_price - opening_high) / opening_high) * 100
+                ((confirmation_close - opening_high) / opening_high) * 100
                 if opening_high > 0 else 0
             )
 
             bearish_breakout_strength = (
-                ((opening_low - current_price) / opening_low) * 100
+                ((opening_low - confirmation_close) / opening_low) * 100
                 if opening_low > 0 else 0
             )
 
-            recent_candles = today_data.tail(3)
+            active_breakout_strength = max(bullish_breakout_strength, bearish_breakout_strength, 0)
 
             return {
-                "latest": latest,
-                "current_price": current_price,
+                "opening_candle": opening_candle,
+                "confirmation_candle": confirmation_candle,
+                "current_price": confirmation_close,
                 "today_open": today_open,
                 "previous_close": previous_close,
                 "opening_high": opening_high,
                 "opening_low": opening_low,
+                "confirmation_open": confirmation_open,
+                "confirmation_high": confirmation_high,
+                "confirmation_low": confirmation_low,
+                "confirmation_close": confirmation_close,
                 "ema20": ema20,
                 "ema50": ema50,
                 "vwap": vwap,
                 "gap_pct": gap_pct,
-                "momentum_pct": momentum_pct,
-                "current_volume": current_volume,
-                "avg_volume": avg_volume,
+                "confirmation_volume": confirmation_volume,
+                "avg_first_hour_volume": avg_first_hour_volume,
                 "volume_ratio": volume_ratio,
                 "bullish_breakout_strength": bullish_breakout_strength,
                 "bearish_breakout_strength": bearish_breakout_strength,
+                "active_breakout_strength": active_breakout_strength,
             }
 
         except Exception as e:
-            logger.error(f"Error calculating metrics: {e}")
+            logger.error("Error calculating metrics: %s", e)
             return None
 
-    def check_bullish(self, symbol: str, metrics: Dict) -> Optional[Dict]:
+    def check_bullish(self, symbol: str, metrics: Dict) -> Tuple[Optional[Dict], Optional[str]]:
         """Check bullish ORB continuation setup."""
         try:
-            if not metrics:
-                return None
+            confirmation_close = metrics["confirmation_close"]
+            breakout_strength = metrics["bullish_breakout_strength"]
 
-            gap_pct = metrics["gap_pct"]
-            momentum_pct = metrics["momentum_pct"]
+            if confirmation_close <= metrics["opening_high"]:
+                return None, "failed breakout"
 
-            if gap_pct <= MIN_GAP_PCT:
-                return None
-
-            if not (MIN_MOMENTUM_PCT <= momentum_pct <= MAX_MOMENTUM_PCT):
-                return None
+            if not (MIN_BREAKOUT_STRENGTH_PCT <= breakout_strength <= MAX_BREAKOUT_STRENGTH_PCT):
+                return None, "failed momentum"
 
             ema_aligned = metrics["ema20"] > metrics["ema50"]
-            clean_structure = self.is_clean_structure(metrics["latest"], "BULLISH")
+            if not ema_aligned:
+                return None, "failed EMA"
 
-            if (
-                metrics["current_price"] > metrics["opening_high"]
-                and ema_aligned
-                and metrics["current_price"] > metrics["vwap"]
-                and metrics["volume_ratio"] >= MIN_VOLUME_RATIO
-                and metrics["higher_closes"]
-                and clean_structure
-            ):
-                score = self.calculate_score(
-                    gap_pct=gap_pct,
-                    volume_ratio=metrics["volume_ratio"],
-                    breakout_strength_pct=metrics["bullish_breakout_strength"],
-                    ema_aligned=ema_aligned,
-                    clean_structure=clean_structure,
-                )
+            vwap_aligned = confirmation_close > metrics["vwap"]
+            if not vwap_aligned:
+                return None, "failed VWAP"
 
-                entry = metrics["current_price"]
-                stop_loss = metrics["opening_low"]
-                risk = entry - stop_loss
+            if metrics["volume_ratio"] < MIN_VOLUME_RATIO:
+                return None, "failed volume"
 
-                if risk <= 0:
-                    return None
+            clean_structure = self.is_clean_structure(metrics["confirmation_candle"], "BULLISH")
+            if not clean_structure:
+                return None, "failed structure"
 
-                target = entry + (risk * 2)
+            score = self.calculate_score(
+                volume_ratio=metrics["volume_ratio"],
+                breakout_strength_pct=breakout_strength,
+                ema_aligned=ema_aligned,
+                vwap_aligned=vwap_aligned,
+                clean_structure=clean_structure,
+            )
 
-                return {
-                    "symbol": symbol,
-                    "direction": "BULLISH",
-                    "entry": round(entry, 2),
-                    "stop_loss": round(stop_loss, 2),
-                    "target": round(target, 2),
-                    "score": score,
-                }
+            entry = confirmation_close
+            stop_loss = metrics["opening_low"]
+            risk = entry - stop_loss
 
-            return None
+            if risk <= 0:
+                return None, "failed risk"
+
+            target = entry + (risk * 2)
+
+            return {
+                "symbol": symbol,
+                "direction": "BULLISH",
+                "entry": round(entry, 2),
+                "stop_loss": round(stop_loss, 2),
+                "target": round(target, 2),
+                "score": score,
+                "breakout_strength": round(breakout_strength, 3),
+                "volume_ratio": round(metrics["volume_ratio"], 2),
+            }, None
 
         except Exception as e:
-            logger.error(f"Error checking bullish for {symbol}: {e}")
-            return None
+            logger.error("Error checking bullish for %s: %s", symbol, e)
+            return None, "internal bullish error"
 
-    def check_bearish(self, symbol: str, metrics: Dict) -> Optional[Dict]:
+    def check_bearish(self, symbol: str, metrics: Dict) -> Tuple[Optional[Dict], Optional[str]]:
         """Check bearish ORB continuation setup."""
         try:
-            if not metrics:
-                return None
+            confirmation_close = metrics["confirmation_close"]
+            breakout_strength = metrics["bearish_breakout_strength"]
 
-            gap_pct = metrics["gap_pct"]
-            momentum_pct = metrics["momentum_pct"]
+            if confirmation_close >= metrics["opening_low"]:
+                return None, "failed breakout"
 
-            if gap_pct >= -MIN_GAP_PCT:
-                return None
-
-            if not (-MAX_MOMENTUM_PCT <= momentum_pct <= -MIN_MOMENTUM_PCT):
-                return None
+            if not (MIN_BREAKOUT_STRENGTH_PCT <= breakout_strength <= MAX_BREAKOUT_STRENGTH_PCT):
+                return None, "failed momentum"
 
             ema_aligned = metrics["ema20"] < metrics["ema50"]
-            clean_structure = self.is_clean_structure(metrics["latest"], "BEARISH")
+            if not ema_aligned:
+                return None, "failed EMA"
 
-            if (
-                metrics["current_price"] < metrics["opening_low"]
-                and ema_aligned
-                and metrics["current_price"] < metrics["vwap"]
-                and metrics["volume_ratio"] >= MIN_VOLUME_RATIO
-                and metrics["lower_closes"]
-                and clean_structure
-            ):
-                score = self.calculate_score(
-                    gap_pct=gap_pct,
-                    volume_ratio=metrics["volume_ratio"],
-                    breakout_strength_pct=metrics["bearish_breakout_strength"],
-                    ema_aligned=ema_aligned,
-                    clean_structure=clean_structure,
-                )
+            vwap_aligned = confirmation_close < metrics["vwap"]
+            if not vwap_aligned:
+                return None, "failed VWAP"
 
-                entry = metrics["current_price"]
-                stop_loss = metrics["opening_high"]
-                risk = stop_loss - entry
+            if metrics["volume_ratio"] < MIN_VOLUME_RATIO:
+                return None, "failed volume"
 
-                if risk <= 0:
-                    return None
+            clean_structure = self.is_clean_structure(metrics["confirmation_candle"], "BEARISH")
+            if not clean_structure:
+                return None, "failed structure"
 
-                target = entry - (risk * 2)
+            score = self.calculate_score(
+                volume_ratio=metrics["volume_ratio"],
+                breakout_strength_pct=breakout_strength,
+                ema_aligned=ema_aligned,
+                vwap_aligned=vwap_aligned,
+                clean_structure=clean_structure,
+            )
 
-                return {
-                    "symbol": symbol,
-                    "direction": "BEARISH",
-                    "entry": round(entry, 2),
-                    "stop_loss": round(stop_loss, 2),
-                    "target": round(target, 2),
-                    "score": score,
-                }
+            entry = confirmation_close
+            stop_loss = metrics["opening_high"]
+            risk = stop_loss - entry
 
-            return None
+            if risk <= 0:
+                return None, "failed risk"
+
+            target = entry - (risk * 2)
+
+            return {
+                "symbol": symbol,
+                "direction": "BEARISH",
+                "entry": round(entry, 2),
+                "stop_loss": round(stop_loss, 2),
+                "target": round(target, 2),
+                "score": score,
+                "breakout_strength": round(breakout_strength, 3),
+                "volume_ratio": round(metrics["volume_ratio"], 2),
+            }, None
 
         except Exception as e:
-            logger.error(f"Error checking bearish for {symbol}: {e}")
-            return None
+            logger.error("Error checking bearish for %s: %s", symbol, e)
+            return None, "internal bearish error"
+
+    def get_primary_rejection_reason(self, metrics: Dict) -> str:
+        """Return the first strategy filter that failed for debug logging."""
+        bullish_breakout = metrics["confirmation_close"] > metrics["opening_high"]
+        bearish_breakout = metrics["confirmation_close"] < metrics["opening_low"]
+
+        if not bullish_breakout and not bearish_breakout:
+            return "failed breakout"
+
+        if bullish_breakout:
+            if metrics["bullish_breakout_strength"] < MIN_BREAKOUT_STRENGTH_PCT:
+                return "failed momentum"
+            if metrics["bullish_breakout_strength"] > MAX_BREAKOUT_STRENGTH_PCT:
+                return "failed momentum"
+            if not metrics["ema20"] > metrics["ema50"]:
+                return "failed EMA"
+            if not metrics["confirmation_close"] > metrics["vwap"]:
+                return "failed VWAP"
+            if metrics["volume_ratio"] < MIN_VOLUME_RATIO:
+                return "failed volume"
+            if not self.is_clean_structure(metrics["confirmation_candle"], "BULLISH"):
+                return "failed structure"
+
+        if bearish_breakout:
+            if metrics["bearish_breakout_strength"] < MIN_BREAKOUT_STRENGTH_PCT:
+                return "failed momentum"
+            if metrics["bearish_breakout_strength"] > MAX_BREAKOUT_STRENGTH_PCT:
+                return "failed momentum"
+            if not metrics["ema20"] < metrics["ema50"]:
+                return "failed EMA"
+            if not metrics["confirmation_close"] < metrics["vwap"]:
+                return "failed VWAP"
+            if metrics["volume_ratio"] < MIN_VOLUME_RATIO:
+                return "failed volume"
+            if not self.is_clean_structure(metrics["confirmation_candle"], "BEARISH"):
+                return "failed structure"
+
+        return "failed final validation"
+
+    def update_filter_pass_stats(self, metrics: Dict):
+        """Track how many stocks passed each broad filter."""
+        bullish_breakout = metrics["confirmation_close"] > metrics["opening_high"]
+        bearish_breakout = metrics["confirmation_close"] < metrics["opening_low"]
+
+        if bullish_breakout or bearish_breakout:
+            self.increment_stat("breakout_ok")
+
+        bullish_ema = bullish_breakout and metrics["ema20"] > metrics["ema50"]
+        bearish_ema = bearish_breakout and metrics["ema20"] < metrics["ema50"]
+
+        if bullish_ema or bearish_ema:
+            self.increment_stat("ema_ok")
+
+        bullish_vwap = bullish_breakout and metrics["confirmation_close"] > metrics["vwap"]
+        bearish_vwap = bearish_breakout and metrics["confirmation_close"] < metrics["vwap"]
+
+        if bullish_vwap or bearish_vwap:
+            self.increment_stat("vwap_ok")
+
+        if metrics["volume_ratio"] >= MIN_VOLUME_RATIO:
+            self.increment_stat("volume_ok")
+
+        bullish_momentum = MIN_BREAKOUT_STRENGTH_PCT <= metrics["bullish_breakout_strength"] <= MAX_BREAKOUT_STRENGTH_PCT
+        bearish_momentum = MIN_BREAKOUT_STRENGTH_PCT <= metrics["bearish_breakout_strength"] <= MAX_BREAKOUT_STRENGTH_PCT
+
+        if (bullish_breakout and bullish_momentum) or (bearish_breakout and bearish_momentum):
+            self.increment_stat("momentum_ok")
+
+        bullish_structure = bullish_breakout and self.is_clean_structure(metrics["confirmation_candle"], "BULLISH")
+        bearish_structure = bearish_breakout and self.is_clean_structure(metrics["confirmation_candle"], "BEARISH")
+
+        if bullish_structure or bearish_structure:
+            self.increment_stat("structure_ok")
 
     def scan_stock(self, symbol: str) -> Optional[Dict]:
         """Scan one stock for bullish or bearish ORB setup."""
         try:
+            self.increment_stat("total_scanned")
+
             data = self.fetch_stock_data(symbol)
             if data is None or data.empty:
+                self.log_rejection(symbol, "no data")
                 return None
 
             data = self.add_indicators(data)
             today_data = self.get_today_data(data)
 
             if today_data is None or today_data.empty:
+                self.log_rejection(symbol, "no today data")
                 return None
+
+            self.increment_stat("data_ok")
 
             metrics = self.calculate_metrics(data, today_data)
             if metrics is None:
+                self.log_rejection(symbol, "missing ORB or confirmation candle")
                 return None
 
-            bullish = self.check_bullish(symbol, metrics)
-            bearish = self.check_bearish(symbol, metrics)
+            self.increment_stat("orb_ok")
+            self.update_filter_pass_stats(metrics)
+
+            logger.info(
+                "%s DEBUG -> ORB high=%.2f | ORB low=%.2f | confirmation close=%.2f | "
+                "bull breakout=%.3f%% | bear breakout=%.3f%% | volume ratio=%.2f | EMA20=%.2f | EMA50=%.2f | VWAP=%.2f",
+                symbol,
+                metrics["opening_high"],
+                metrics["opening_low"],
+                metrics["confirmation_close"],
+                metrics["bullish_breakout_strength"],
+                metrics["bearish_breakout_strength"],
+                metrics["volume_ratio"],
+                metrics["ema20"],
+                metrics["ema50"],
+                metrics["vwap"],
+            )
+
+            bullish, bullish_rejection = self.check_bullish(symbol, metrics)
+            bearish, bearish_rejection = self.check_bearish(symbol, metrics)
 
             if bullish and bearish:
+                self.increment_stat("accepted")
                 return bullish if bullish["score"] >= bearish["score"] else bearish
 
-            return bullish or bearish
+            if bullish:
+                self.increment_stat("accepted")
+                return bullish
+
+            if bearish:
+                self.increment_stat("accepted")
+                return bearish
+
+            rejection_reason = self.get_primary_rejection_reason(metrics)
+            if rejection_reason == "failed final validation":
+                rejection_reason = bullish_rejection or bearish_rejection or rejection_reason
+
+            self.log_rejection(symbol, rejection_reason, metrics)
+            return None
 
         except Exception as e:
-            logger.error(f"Error scanning {symbol}: {e}")
+            logger.error("Error scanning %s: %s", symbol, e)
+            self.log_rejection(symbol, "internal scan error")
             return None
 
     async def scan_all_stocks(self) -> List[Dict]:
         """Scan all NSE F&O stocks in parallel."""
+        self.reset_debug_stats()
         loop = asyncio.get_running_loop()
 
         tasks = [
@@ -490,13 +679,24 @@ class TradeScanner:
 
         for result in results:
             if isinstance(result, Exception):
-                logger.error(f"Stock scan task failed: {result}")
+                logger.error("Stock scan task failed: %s", result)
                 continue
 
             if result:
                 trades.append(result)
 
         trades.sort(key=lambda x: x["score"], reverse=True)
+
+        logger.info("SCAN SUMMARY -> total stocks scanned: %s", self.debug_stats.get("total_scanned", 0))
+        logger.info("SCAN SUMMARY -> data ok: %s", self.debug_stats.get("data_ok", 0))
+        logger.info("SCAN SUMMARY -> ORB/confirmation ok: %s", self.debug_stats.get("orb_ok", 0))
+        logger.info("SCAN SUMMARY -> passed breakout: %s", self.debug_stats.get("breakout_ok", 0))
+        logger.info("SCAN SUMMARY -> passed EMA: %s", self.debug_stats.get("ema_ok", 0))
+        logger.info("SCAN SUMMARY -> passed VWAP: %s", self.debug_stats.get("vwap_ok", 0))
+        logger.info("SCAN SUMMARY -> passed volume: %s", self.debug_stats.get("volume_ok", 0))
+        logger.info("SCAN SUMMARY -> passed momentum: %s", self.debug_stats.get("momentum_ok", 0))
+        logger.info("SCAN SUMMARY -> passed structure: %s", self.debug_stats.get("structure_ok", 0))
+        logger.info("SCAN SUMMARY -> accepted setups: %s", self.debug_stats.get("accepted", 0))
 
         return trades[:TOP_STOCKS_LIMIT]
 
@@ -522,10 +722,9 @@ class TelegramNotifier:
                 message += "No high-probability ORB setups found today.\n"
                 message += "\n⚠️ No trade is better than a weak trade."
             else:
-                for idx, trade in enumerate(trades, 1):
-                    direction_icon = "🟢" if trade["direction"] == "BULLISH" else "🔴"
-
-                    message += f"{idx}. {direction_icon} {trade['symbol']}\n"
+                for idx, trade in enumerate(trades[:TOP_STOCKS_LIMIT], 1):
+                    message += f"{idx}. {trade['symbol']}\n"
+                    message += f"   Direction: {trade['direction']}\n"
                     message += f"   Entry: ₹{trade['entry']}\n"
                     message += f"   SL: ₹{trade['stop_loss']}\n"
                     message += f"   Target: ₹{trade['target']}\n"
@@ -537,9 +736,9 @@ class TelegramNotifier:
             logger.info("Trade message sent successfully")
 
         except TelegramError as e:
-            logger.error(f"Telegram error: {e}")
+            logger.error("Telegram error: %s", e)
         except Exception as e:
-            logger.error(f"Error sending message: {e}")
+            logger.error("Error sending message: %s", e)
 
 
 class TradeBotScheduler:
@@ -555,11 +754,11 @@ class TradeBotScheduler:
         try:
             logger.info("Starting ORB market scan...")
             trades = await self.scanner.scan_all_stocks()
-            logger.info(f"Scan complete: {len(trades)} high-probability trades found")
+            logger.info("Scan complete: %s high-probability trades found", len(trades))
             await self.notifier.send_trade_message(trades)
 
         except Exception as e:
-            logger.error(f"Error in scan_and_notify: {e}")
+            logger.error("Error in scan_and_notify: %s", e)
 
     def schedule_jobs(self):
         """Schedule the ORB scanning job."""
@@ -568,14 +767,14 @@ class TradeBotScheduler:
             "cron",
             day_of_week="0-4",
             hour=9,
-            minute=20,
+            minute=25,
             timezone=IST,
-            id="orb_trade_scan_0920",
+            id="orb_trade_scan_0925",
             replace_existing=True,
         )
 
         logger.info("Jobs scheduled successfully")
-        logger.info("Bot will scan at 09:20 AM IST, Monday to Friday")
+        logger.info("Bot will scan at 09:25 AM IST, Monday to Friday")
 
     async def run(self):
         """Start scheduler and keep bot alive."""
@@ -589,7 +788,7 @@ class TradeBotScheduler:
                 await asyncio.sleep(1)
 
         except Exception as e:
-            logger.error(f"Error running bot: {e}")
+            logger.error("Error running bot: %s", e)
         finally:
             self.scheduler.shutdown(wait=False)
             self.scanner.executor.shutdown(wait=True)
